@@ -1,5 +1,6 @@
 import os
 import aiohttp
+import emoji
 from aiogram import types, Router, Bot
 from bs4 import BeautifulSoup
 from aiogram.filters import CommandStart, Command
@@ -12,7 +13,6 @@ from app.log_settings import logger_settings
 
 # Настройка логирования с помощью log_settings.py
 logger = logger_settings('handlers')
-
 
 router = Router()
 # Создание объекта бота
@@ -40,7 +40,7 @@ async def convert(message: Message) -> None:
 # Функция парсинг курса
 async def fetch_exchange_rate(query) -> str:
     url = f'https://www.google.com/search?q={query}'
-    if query.isascii():
+    if ':' not in emoji.demojize(query):
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 html = await response.text()
@@ -51,29 +51,57 @@ async def fetch_exchange_rate(query) -> str:
         raise AttributeError
 
 
+class ConvertStates(StatesGroup):
+    waiting_for_currency_input = State()
+    waiting_for_amount_input = State()
+
+
 # Обработчик инлайн-кнопок USD to RUB и EUR to RUB
 @router.callback_query(lambda c: c.data in ['USD to RUB', 'EUR to RUB'])
-async def process_callback(callback_query: types.CallbackQuery) -> None:
+async def process_callback(callback_query: types.CallbackQuery, state: FSMContext) -> None:
     query_data = callback_query.data
     logger.info(f'Пользователь {callback_query.from_user.username} id: {callback_query.from_user.id}'
                 f' нажал на кнопку {query_data}')
 
-    result = await fetch_exchange_rate(query_data)
+    # Сохранение выбранной валюты в состоянии
+    await state.update_data(currency_pair=query_data)
+
+    # Запрос ввода суммы
+    await bot.send_message(callback_query.from_user.id, "Введите сумму для конвертации:")
+
+    # Переводим в состояние ожидания ввода суммы
+    await state.set_state(ConvertStates.waiting_for_amount_input)
+    await bot.answer_callback_query(callback_query.id)
+
+
+# Обработчик ввода суммы от пользователя
+@router.message(ConvertStates.waiting_for_amount_input)
+async def handle_amount_input(message: Message, state: FSMContext) -> None:
+    try:
+        user_data = await state.get_data()
+        currency_pair = user_data.get('currency_pair')
+        amount = message.text.replace(' ', '').replace('.', '')
+    except AttributeError:
+        await message.answer("Пожалуйста, введите корректное числовое значение.")
+        return
+
+    if not amount.isdigit():
+        await message.answer("Пожалуйста, введите корректное числовое значение.")
+        return
+
+    # Формируем запрос для парсинга с учётом суммы
+    query = f'{amount} {currency_pair}'
+    result = await fetch_exchange_rate(query)
+
     if result:
-        await bot.send_message(callback_query.from_user.id, result)
-        logger.info(f'Пользователю {callback_query.from_user.username} id: {callback_query.from_user.id}'
-                    f' отправлено сообщение {result}')
-
-        # Уведомление Telegram, что callback обработан
-        await bot.answer_callback_query(callback_query.id)
+        await message.answer(result)
+        logger.info(
+            f'Пользователь {message.from_user.username} id: {message.from_user.id} запросил курс {query} и получил ответ: {result}')
+        await state.clear()
     else:
-        await bot.send_message(callback_query.from_user.id, 'Не удалось получить курс валюты')
-        logger.error(f'Не удалось получить курс валюты для пользователя {callback_query.from_user.username}'
-                     f' id: {callback_query.from_user.id} к {query_data}')
-
-
-class ConvertStates(StatesGroup):
-    waiting_for_currency_input = State()
+        await message.answer("Не удалось получить курс валюты, попробуйте еще раз.")
+        logger.error(
+            f'Не удалось получить курс валюты для пользователя {message.from_user.username} id: {message.from_user.id} к {query}')
 
 
 # Обработчик инлайн-кнопки для собственной валюты
